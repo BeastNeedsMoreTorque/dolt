@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -94,6 +95,7 @@ var _ sql.TableDropper = Database{}
 var _ sql.TableCreator = Database{}
 var _ sql.TableRenamer = Database{}
 var _ sql.TriggerDatabase = Database{}
+var _ sql.StoredProcedureDatabase = Database{}
 
 // NewDatabase returns a new dolt database to use in queries.
 func NewDatabase(name string, dbData env.DbData) Database {
@@ -746,6 +748,82 @@ func (db Database) DropTrigger(ctx *sql.Context, name string) error {
 	return db.dropFragFromSchemasTable(ctx, "trigger", name, sql.ErrTriggerDoesNotExist.New(name))
 }
 
+// GetStoredProcedures implements sql.StoredProcedureDatabase.
+func (db Database) GetStoredProcedures(ctx *sql.Context) ([]sql.StoredProcedureDetails, error) {
+	sqlTbl, ok, err := db.GetTableInsensitive(ctx, doltdb.SchemasTableName)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+	tbl := sqlTbl.(*WritableDoltTable)
+
+	typeCol, ok := tbl.sch.GetAllCols().GetByName(doltdb.SchemasTablesTypeCol)
+	if !ok {
+		return nil, fmt.Errorf("`%s` schema in unexpected format", doltdb.SchemasTableName)
+	}
+	nameCol, ok := tbl.sch.GetAllCols().GetByName(doltdb.SchemasTablesNameCol)
+	if !ok {
+		return nil, fmt.Errorf("`%s` schema in unexpected format", doltdb.SchemasTableName)
+	}
+	fragCol, ok := tbl.sch.GetAllCols().GetByName(doltdb.SchemasTablesFragmentCol)
+	if !ok {
+		return nil, fmt.Errorf("`%s` schema in unexpected format", doltdb.SchemasTableName)
+	}
+
+	rowData, err := tbl.table.GetRowData(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var spds []sql.StoredProcedureDetails
+	err = rowData.Iter(ctx, func(key, val types.Value) (stop bool, err error) {
+		dRow, err := row.FromNoms(tbl.sch, key.(types.Tuple), val.(types.Tuple))
+		if err != nil {
+			return true, err
+		}
+		if typeColVal, ok := dRow.GetColVal(typeCol.Tag); ok && typeColVal.Equals(types.String("storedprocedure")) {
+			name, ok := dRow.GetColVal(nameCol.Tag)
+			if !ok {
+				taggedVals, _ := row.GetTaggedVals(dRow)
+				return true, fmt.Errorf("missing `%s` value for stored procedure row: (%s)", doltdb.SchemasTablesNameCol, taggedVals)
+			}
+			encodedDetails, ok := dRow.GetColVal(fragCol.Tag)
+			if !ok {
+				taggedVals, _ := row.GetTaggedVals(dRow)
+				return true, fmt.Errorf("missing `%s` value for stored procedure row: (%s)", doltdb.SchemasTablesFragmentCol, taggedVals)
+			}
+			spd, err := StringToStoredProcedureDetails(string(name.(types.String)), string(encodedDetails.(types.String)))
+			if err != nil {
+				return true, err
+			}
+			spds = append(spds, spd)
+		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return spds, nil
+}
+
+// SaveStoredProcedure implements sql.StoredProcedureDatabase.
+func (db Database) SaveStoredProcedure(ctx *sql.Context, spd sql.StoredProcedureDetails) error {
+	spdAsString := StoredProcedureDetailsToString(spd)
+	return db.addFragToSchemasTable(ctx,
+		"storedprocedure",
+		strings.ToLower(spd.Name),
+		spdAsString,
+		fmt.Errorf("stored procedure `%s` already exists", spd.Name), //TODO: add a sql error and return that instead
+	)
+}
+
+// DropStoredProcedure implements sql.StoredProcedureDatabase.
+func (db Database) DropStoredProcedure(ctx *sql.Context, name string) error {
+	return db.dropFragFromSchemasTable(ctx, "storedprocedure",
+		strings.ToLower(name), fmt.Errorf("procedure `%s` does not exist", name))
+}
+
 func (db Database) addFragToSchemasTable(ctx *sql.Context, fragType, name, definition string, existingErr error) (retErr error) {
 	tbl, err := GetOrCreateDoltSchemasTable(ctx, db)
 	if err != nil {
@@ -885,4 +963,39 @@ func RegisterSchemaFragments(ctx *sql.Context, db Database, root *doltdb.RootVal
 	}
 
 	return nil
+}
+
+// StoredProcedureDetailsToString returns a string encoding of sql.StoredProcedureDetails, which may be used to store
+// the details in string format.
+func StoredProcedureDetailsToString(spd sql.StoredProcedureDetails) string {
+	return fmt.Sprintf("%d|%d|%s", spd.CreatedAt.UTC().UnixNano(), spd.ModifiedAt.UnixNano(), spd.CreateStatement)
+}
+
+// StringToStoredProcedureDetails decodes a string to sql.StoredProcedureDetails. If the string does not represent an
+// encoded version of sql.StoredProcedureDetails, then an error is thrown.
+func StringToStoredProcedureDetails(name string, encodedDetails string) (sql.StoredProcedureDetails, error) {
+	barIdx := strings.Index(encodedDetails, "|")
+	if barIdx == -1 {
+		return sql.StoredProcedureDetails{}, fmt.Errorf("the string `%s` is not an encoding of a stored procedure", encodedDetails)
+	}
+	createdAt, err := strconv.ParseInt(encodedDetails[:barIdx], 10, 64)
+	if err != nil {
+		return sql.StoredProcedureDetails{}, err
+	}
+	shortedEncodedDetails := encodedDetails[barIdx+1:]
+	barIdx = strings.Index(shortedEncodedDetails, "|")
+	if barIdx == -1 {
+		return sql.StoredProcedureDetails{}, fmt.Errorf("the string `%s` is not an encoding of a stored procedure", encodedDetails)
+	}
+	modifiedAt, err := strconv.ParseInt(shortedEncodedDetails[:barIdx], 10, 64)
+	if err != nil {
+		return sql.StoredProcedureDetails{}, err
+	}
+	shortedEncodedDetails = shortedEncodedDetails[barIdx+1:]
+	return sql.StoredProcedureDetails{
+		Name:            name,
+		CreateStatement: shortedEncodedDetails,
+		CreatedAt:       time.Unix(0, createdAt),
+		ModifiedAt:      time.Unix(0, modifiedAt),
+	}, nil
 }
